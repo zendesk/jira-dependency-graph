@@ -37,12 +37,12 @@ class JiraSearch(object):
         url = self.url + uri
 
         if isinstance(self.auth, str):
-            return requests.get(url, params=params, cookies={'JSESSIONID': self.auth}, headers=headers)
+            return requests.get(url, params=params, cookies={'cloud.session.token': self.auth}, headers=headers)
         else:
             return requests.get(url, params=params, auth=self.auth, headers=headers)
 
     def get_issue(self, key):
-        """ Given an issue key (i.e. JRA-9) return the JSON representation of it. This is the only place where we deal
+        """ Given an issue key (i.e. JRA-9) return the JSON representation of it. This is t_e only place where we deal
             with JIRA's REST API. """
         log('Fetching ' + key)
         # we need to expand subtasks and links since that's what we care about here.
@@ -68,9 +68,11 @@ def build_graph_data(start_issue_key, jira, excludes, show_directions, direction
         return issue['key']
 
     def get_status_color(status_field):
-        status = status_field['statusCategory']['name'].upper()
+        status = status_field['name'].upper()
         if status == 'IN PROGRESS':
             return 'yellow'
+        elif status == 'DANGLING':
+            return 'grey'
         elif status == 'DONE':
             return 'green'
         return 'white'
