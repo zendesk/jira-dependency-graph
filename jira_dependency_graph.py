@@ -1,15 +1,18 @@
 #!/usr/bin/env python
 
-from __future__ import print_function
 
+
+import asyncio
 import argparse
 import json
 import sys
 import getpass
 
 import requests
+from requests_futures.sessions import FuturesSession
 
 from collections import OrderedDict
+from functools import reduce
 
 
 GOOGLE_CHART_URL = 'http://chart.apis.google.com/chart'
@@ -19,6 +22,7 @@ MAX_SUMMARY_LENGTH = 30
 def log(*args):
     print(*args, file=sys.stderr)
 
+session = FuturesSession(max_workers=25)
 
 class JiraSearch(object):
     """ This factory will create the actual method used to fetch issues from JIRA. This is really just a closure that
@@ -32,21 +36,23 @@ class JiraSearch(object):
         self.auth = auth
         self.fields = ','.join(['key', 'summary', 'status', 'description', 'issuetype', 'issuelinks', 'subtasks'])
 
-    def get(self, uri, params={}):
+    async def get(self, uri, params={}):
         headers = {'Content-Type' : 'application/json'}
         url = self.url + uri
 
         if isinstance(self.auth, str):
-            return requests.get(url, params=params, cookies={'cloud.session.token': self.auth}, headers=headers)
+            return session.get(url, params=params, cookies={'cloud.session.token': self.auth}, headers=headers)
         else:
-            return requests.get(url, params=params, auth=self.auth, headers=headers)
+            return session.get(url, params=params, auth=self.auth, headers=headers)
 
-    def get_issue(self, key):
+    async def get_issue(self, key):
         """ Given an issue key (i.e. JRA-9) return the JSON representation of it. This is t_e only place where we deal
             with JIRA's REST API. """
         log('Fetching ' + key)
         # we need to expand subtasks and links since that's what we care about here.
-        response = self.get('/issue/%s' % key, params={'fields': self.fields})
+        future = await self.get('/issue/%s' % key, params={'fields': self.fields})
+        response = future.result()
+
         response.raise_for_status()
         return response.json()
 
@@ -88,13 +94,13 @@ def build_graph_data(start_issue_key, jira, excludes, show_directions, direction
         # log('node ' + issue_key + ' status = ' + str(status))
 
         if islink:
-            return '"{}\\n({})"'.format(issue_key, summary.encode('utf-8'))
-        return '"{}\\n({})" [href="{}", fillcolor="{}", style=filled]'.format(issue_key, summary.encode('utf-8'), jira.get_issue_uri(issue_key), get_status_color(status))
+            return '"{}\\n({})"'.format(issue_key, summary)
+        return '"{}\\n({})" [href="{}", fillcolor="{}", style=filled]'.format(issue_key, summary, jira.get_issue_uri(issue_key), get_status_color(status))
 
     def process_link(fields, issue_key, link):
-        if link.has_key('outwardIssue'):
+        if 'outwardIssue' in link:
             direction = 'outward'
-        elif link.has_key('inwardIssue'):
+        elif 'inwardIssue' in link:
             direction = 'inward'
         else:
             return
@@ -139,9 +145,9 @@ def build_graph_data(start_issue_key, jira, excludes, show_directions, direction
     # since the graph can be cyclic we need to prevent infinite recursion
     seen = []
 
-    def walk(issue_key, graph):
+    async def walk(issue_key, graph):
         """ issue is the JSON representation of the issue """
-        issue = jira.get_issue(issue_key)
+        issue = await jira.get_issue(issue_key)
         children = []
         fields = issue['fields']
         seen.append(issue_key)
@@ -167,7 +173,7 @@ def build_graph_data(start_issue_key, jira, excludes, show_directions, direction
                         create_node_text(subtask_key, subtask['fields']))
                     graph.append(node)
                     children.append(subtask_key)
-            if fields.has_key('subtasks') and not ignore_subtasks:
+            if 'subtasks' in fields and not ignore_subtasks:
                 for subtask in fields['subtasks']:
                     subtask_key = get_key(subtask)
                     log(issue_key + ' => has subtask => ' + subtask_key)
@@ -177,7 +183,7 @@ def build_graph_data(start_issue_key, jira, excludes, show_directions, direction
                     graph.append(node)
                     children.append(subtask_key)
 
-        if fields.has_key('issuelinks'):
+        if 'issuelinks' in fields:
             for other_link in fields['issuelinks']:
                 result = process_link(fields, issue_key, other_link)
                 if result is not None:
@@ -185,13 +191,19 @@ def build_graph_data(start_issue_key, jira, excludes, show_directions, direction
                     children.append(result[0])
                     if result[1] is not None:
                         graph.append(result[1])
+
         # now construct graph data for all subtasks and links of this issue
-        for child in (x for x in children if x not in seen):
+        futures = [
             walk(child, graph)
+            for child
+            in (x for x in children if x not in seen)
+        ]
+        await asyncio.gather(*futures)
         return graph
 
     project_prefix = start_issue_key.split('-', 1)[0]
-    return walk(start_issue_key, [])
+    loop = asyncio.new_event_loop()
+    return loop.run_until_complete(walk(start_issue_key, []))
 
 
 def create_graph_image(graph_data, image_file, node_shape):
@@ -204,7 +216,7 @@ def create_graph_image(graph_data, image_file, node_shape):
 
     response = requests.post(GOOGLE_CHART_URL, data = {'cht':'gv', 'chl': digraph})
 
-    with open(image_file, 'w+') as image:
+    with open(image_file, 'wb+') as image:
         print('Writing to ' + image_file)
         image.write(response.content)
 
@@ -241,7 +253,7 @@ def filter_duplicates(lst):
     # Enumerate the list to restore order lately; reduce the sorted list; restore order
     def append_unique(acc, item):
         return acc if acc[-1][1] == item[1] else acc.append(item) or acc
-    srt_enum = sorted(enumerate(lst), key=lambda (i, val): val)
+    srt_enum = sorted(enumerate(lst), key=lambda i_val: i_val[1])
     return [item[1] for item in sorted(reduce(append_unique, srt_enum, [srt_enum[0]]))]
 
 
@@ -254,7 +266,7 @@ def main():
     else:
         # Basic Auth is usually easier for scripts like this to deal with than Cookies.
         user = options.user if options.user is not None \
-                    else raw_input('Username: ')
+                    else input('Username: ')
         password = options.password if options.password is not None \
                     else getpass.getpass('Password: ')
         auth = (user, password)

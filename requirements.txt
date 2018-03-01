@@ -1,3 +1,4 @@
 requests ~= 2.12
+requests-futures
 Flask
 gunicorn
